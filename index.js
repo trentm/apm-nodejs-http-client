@@ -1,6 +1,6 @@
 'use strict'
 
-const assert = require('assert').strict
+const assert = require('assert')
 const crypto = require('crypto')
 const http = require('http')
 const https = require('https')
@@ -645,14 +645,12 @@ function getChoppedStreamHandler (client, onerror) {
         // There was an error: clean up resources.
         //
         // Note that in Node v8, destroying the gzip stream results in it
-        // erroring with the following. No harm, however.
+        // emitting an "error" event as follows. No harm, however.
         //    Error: gzip stream error: zlib binding closed
         //      at Gzip._transform (zlib.js:369:15)
         //      ...
         destroyStream(gzipStream)
-        if (!completedFromPart['intakeReq']) { // eslint-disable-line dot-notation
-          intakeReq.destroy()
-        }
+        intakeReq.destroy()
       }
 
       client.sent = client._received
@@ -752,6 +750,10 @@ function getChoppedStreamHandler (client, onerror) {
         if (intakeRes.statusCode === SUCCESS_STATUS_CODE) {
           err = new Error(`premature apm-server response with statusCode=${intakeRes.statusCode}`)
         }
+        // There is no point (though no harm) in sending more data to the APM
+        // server. In case reading the error response body takes a while, pause
+        // the gzip stream until it is destroyed in `completePart()`.
+        gzipStream.pause()
       }
 
       // Handle events on the intake response.
