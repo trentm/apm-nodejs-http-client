@@ -31,6 +31,8 @@ const requiredOpts = [
   'userAgent'
 ]
 
+const MAX_QUEUE_SIZE = 1024 // XXX make this configurable a la https://www.elastic.co/guide/en/apm/agent/java/current/config-reporter.html#config-max-queue-size
+// const MAX_QUEUE_SIZE = Infinity // XXX make this configurable a la https://www.elastic.co/guide/en/apm/agent/java/current/config-reporter.html#config-max-queue-size
 const containerInfo = getContainerInfo()
 
 const node8 = process.version.indexOf('v8.') === 0
@@ -64,8 +66,10 @@ function Client (opts) {
   Writable.call(this, { objectMode: true })
 
   this._corkTimer = null
-  this._received = 0 // number of events given to the client for reporting
-  this.sent = 0 // number of events written to the socket
+  this._numEvents = 0 // number of events given to the client for reporting
+  this._numEventsDropped = 0 // number of events dropped because overloaded
+  this._numEventsEnqueued = 0 // number of events written through to be sent
+  this.sent = 0 // number of events sent to APM server (not necessarily accepted)
   this._agent = null
   this._active = false
   this._onflushed = null
@@ -297,20 +301,20 @@ Client.prototype._write = function (obj, enc, cb) {
     const t = process.hrtime()
     const chunk = this._encode(obj, enc)
     const d = process.hrtime(t)
-    this._log.warn({
+    this._log.trace({
       elapsedMs: d[0] * 1e3 + d[1] / 1e6,
       numObjs: 1,
       chunkLen: chunk.length
     }, '_write: encode object')
 
-    this._received++
+    this._numEventsEnqueued++
     this._chopper.write(chunk, cb)
     // this._chopper.write(this._encode(obj, enc), cb)
   }
 }
 
 Client.prototype._writev = function (objs, cb) {
-  this._log.warn({writableState: this._writableState, err: new Error('hi')}, '_writev %d objs', objs.length)
+  this._log.trace({writableState: this._writableState}, '_writev %d objs', objs.length)
   let offset = 0
 
   const processBatch = () => {
@@ -360,12 +364,12 @@ Client.prototype._writevCleaned = function (objs, cb) {
     chunkLen: chunk.length
   }, '_writevCleaned: encoded objects')
 
-  this._received += objs.length
+  this._numEventsEnqueued += objs.length
   this._chopper.write(chunk, cb)
 }
 
 Client.prototype._writeFlush = function (cb) {
-  this._log.warn('_writeFlush')
+  this._log.trace('_writeFlush')
   if (this._active) {
     this._onflushed = cb
     this._chopper.chop()
@@ -376,7 +380,7 @@ Client.prototype._writeFlush = function (cb) {
 
 Client.prototype._maybeCork = function () {
   if (!this._writableState.corked && this._conf.bufferWindowTime !== -1) {
-    // this._log.warn('cork (from _maybeCork)')
+    // this._log.trace('cork (from _maybeCork)')
     this.cork()
     if (this._corkTimer && this._corkTimer.refresh) {
       // the refresh function was added in Node 10.2.0
@@ -390,7 +394,7 @@ Client.prototype._maybeCork = function () {
           !this._writableState.bufferProcessing &&
           !!this._writableState.bufferedRequest
         if (expectToClearBuffer) {
-          this._log.warn({writableState: this._writableState, expectToClearBuffer},
+          this._log.trace({writableState: this._writableState, expectToClearBuffer},
             'uncork (from _corkTimer)')
         }
         this.uncork()
@@ -421,7 +425,7 @@ Client.prototype._maybeUncork = function () {
           !this._writableState.bufferProcessing &&
           !!this._writableState.bufferedRequest
         if (expectToClearBuffer) {
-          this._log.warn({writableState: this._writableState, expectToClearBuffer},
+          this._log.trace({writableState: this._writableState, expectToClearBuffer},
             'uncork (from _maybeUncork + nextTick)')
         }
         this.uncork()
@@ -465,18 +469,21 @@ Client.prototype._isUnsafeToWrite = function () {
   return this.destroyed
 }
 
-let numEvents = 0
-Client.prototype._noteEvent = function () {
-  numEvents++
-  if (numEvents % 10000 === 0) {
-    this._log.warn('maor events: numEvents=%d corked?=%s',
-      numEvents, this._writableState.corked)
+Client.prototype._shouldDropEvent = function () {
+  this._numEvents++
+  if (this._numEvents % 10000 === 0) { // XXX
+    this._log.trace('maor events: numEvents=%d', this._numEvents)
   }
+
+  const shouldDrop = this._writableState.length >= MAX_QUEUE_SIZE
+  if (shouldDrop) {
+    this._numEventsDropped++
+  }
+  return shouldDrop
 }
 
 Client.prototype.sendSpan = function (span, cb) {
-  this._noteEvent()
-  if (this._isUnsafeToWrite()) {
+  if (this._isUnsafeToWrite() || this._shouldDropEvent()) {
     return
   }
   this._maybeCork()
@@ -484,8 +491,7 @@ Client.prototype.sendSpan = function (span, cb) {
 }
 
 Client.prototype.sendTransaction = function (transaction, cb) {
-  this._noteEvent()
-  if (this._isUnsafeToWrite()) {
+  if (this._isUnsafeToWrite() || this._shouldDropEvent()) {
     return
   }
   this._maybeCork()
@@ -493,8 +499,7 @@ Client.prototype.sendTransaction = function (transaction, cb) {
 }
 
 Client.prototype.sendError = function (error, cb) {
-  this._noteEvent()
-  if (this._isUnsafeToWrite()) {
+  if (this._isUnsafeToWrite() || this._shouldDropEvent()) {
     return
   }
   this._maybeCork()
@@ -502,8 +507,7 @@ Client.prototype.sendError = function (error, cb) {
 }
 
 Client.prototype.sendMetricSet = function (metricset, cb) {
-  this._noteEvent()
-  if (this._isUnsafeToWrite()) {
+  if (this._isUnsafeToWrite() || this._shouldDropEvent()) {
     return
   }
   this._maybeCork()
@@ -653,7 +657,7 @@ function getChoppedStreamHandler (client, onerror) {
         intakeReq.destroy()
       }
 
-      client.sent = client._received
+      client.sent = client._numEventsEnqueued
       client._active = false
       if (client._onflushed) {
         client._onflushed()
@@ -661,10 +665,10 @@ function getChoppedStreamHandler (client, onerror) {
       }
 
       if (err) {
-        log.debug({ timeline, bytesWritten, err }, 'conclude intake request: error')
+        log.error({ timeline, bytesWritten, err }, 'conclude intake request: error')
         onerror(err)
       } else {
-        log.trace({ timeline, bytesWritten }, 'conclude intake request: success')
+        log.error({ timeline, bytesWritten }, 'conclude intake request: success')
       }
       next()
     }
@@ -839,7 +843,7 @@ function getChoppedStreamHandler (client, onerror) {
   function onStream (stream, next) {
     const startT = process.hrtime()
     const startL = client._writableState.length
-    client._log.warn({ queueLen: client._writableState.length }, 'onStream: start')
+    client._log.trace({ queueLen: client._writableState.length }, 'onStream: start')
     const timeline = [['start', deltaMs(startT)]]
 
     const onerrorproxy = (err) => {
@@ -918,7 +922,7 @@ function getChoppedStreamHandler (client, onerror) {
       //    would not get it here as the internal error listener would have
       //    been removed and the stream would throw the error instead
 
-      client.sent = client._received
+      client.sent = client._numEventsEnqueued
       client._active = false
       if (client._onflushed) {
         client._onflushed()
@@ -927,7 +931,7 @@ function getChoppedStreamHandler (client, onerror) {
 
       const diffT = process.hrtime(startT)
       const diffL = client._writableState.length - startL
-      client._log.warn({
+      client._log.trace({
         timeline,
         elapsedMs: diffT[0] * 1e3 + diffT[1] / 1e6,
         queueLenDelta: startL + ' -> ' + client._writableState.length + ' = ' + diffL,
@@ -1214,6 +1218,7 @@ function processIntakeErrorResponse (res, buf) {
   err.code = res.statusCode
 
   if (buf.length > 0) {
+    // https://www.elastic.co/guide/en/apm/server/current/events-api.html#events-api-errors
     const body = buf.toString('utf8')
     const contentType = res.headers['content-type']
     if (contentType && contentType.startsWith('application/json')) {
