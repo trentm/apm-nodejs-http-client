@@ -314,31 +314,39 @@ Client.prototype._write = function (obj, enc, cb) {
 }
 
 Client.prototype._writev = function (objs, cb) {
+  // Limit the size of individual writes to manageable batches, primarily to
+  // limit large sync pauses due to `_encode`ing in `_writevCleaned`. This value
+  // is not particularly well tuned. It was selected to get syncs pauses under
+  // 10ms on a developer machine.
+  const MAX_WRITE_BATCH_SIZE = 100
+
   this._log.trace({writableState: this._writableState}, '_writev %d objs', objs.length)
   let offset = 0
 
   const processBatch = () => {
-    let index = -1
-    for (let i = offset; i < objs.length; i++) {
+    let flushIdx = -1
+    const limit = Math.min(objs.length, offset + MAX_WRITE_BATCH_SIZE)
+    for (let i = offset; i < limit; i++) {
       if (objs[i].chunk === flush) {
-        index = i
+        flushIdx = i
         break
       }
     }
 
-    if (offset === 0 && index === -1) {
-      // normally there's no flush object queued, so here's a shortcut that just
-      // skips all the complicated splitting logic
+    if (offset === 0 && flushIdx === -1 && objs.length <= MAX_WRITE_BATCH_SIZE) {
+      // A shortcut if there is no `flush` and the whole `objs` fits in a batch.
       this._writevCleaned(objs, cb)
-    } else if (index === -1) {
-      // no more flush elements in the queue, just write the rest
-      this._writevCleaned(objs.slice(offset), cb)
-    } else if (index > offset) {
-      // there's a few items in the queue before we need to flush, let's first write those
-      this._writevCleaned(objs.slice(offset, index), processBatch)
-      offset = index
-    } else if (index === objs.length - 1) {
-      // the last item in the queue is a flush
+    } else if (flushIdx === -1) {
+      // No `flush` in this batch.
+      this._writevCleaned(objs.slice(offset, limit),
+        limit === objs.length ? cb : processBatch)
+      offset = limit
+    } else if (flushIdx > offset) {
+      // There are some events in the queue before a `flush`.
+      this._writevCleaned(objs.slice(offset, flushIdx), processBatch)
+      offset = flushIdx
+    } else if (flushIdx === objs.length - 1) {
+      // The next item is a flush, and it is the *last* item in the queue.
       this._writeFlush(cb)
     } else {
       // the next item in the queue is a flush
