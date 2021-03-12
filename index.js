@@ -66,16 +66,26 @@ function Client (opts) {
   Writable.call(this, { objectMode: true })
 
   this._corkTimer = null
-  this._numEvents = 0 // number of events given to the client for reporting
-  this._numEventsDropped = 0 // number of events dropped because overloaded
-  this._numEventsEnqueued = 0 // number of events written through to be sent
-  this.sent = 0 // number of events sent to APM server (not necessarily accepted)
   this._agent = null
   this._active = false
   this._onflushed = null
   this._transport = null
   this._configTimer = null
   this._encodedMetadata = null
+
+  // Internal runtime stats. Possibly useful for developer debugging/tuning.
+  this._numEvents = 0 // number of events given to the client for reporting
+  this._numEventsDropped = 0 // number of events dropped because overloaded
+  this._numEventsEnqueued = 0 // number of events written through to be sent
+  this.sent = 0 // number of events sent to APM server (not necessarily accepted)
+  this._slowWriteBatch = { // data on slow or the slowest _writeBatch
+    numOver10Ms: 0,
+    // Data for the slowest _writeBatch:
+    encodeTimeMs: 0,
+    fullTimeMs: 0,
+    numEvents: 0,
+    numBytes: 0
+  }
 
   this.config(opts)
   this._log = this._conf.logger
@@ -124,6 +134,17 @@ function Client (opts) {
 
   if (this._conf.centralConfig) {
     this._pollConfig()
+  }
+}
+
+// Return current internal stats.
+Client.prototype._getStats = function () {
+  return {
+    numEvents: this._numEvents,
+    numEventsDropped: this._numEventsDropped,
+    numEventsEnqueued: this._numEventsEnqueued,
+    numEventsSent: this.sent,
+    slowWriteBatch: this._slowWriteBatch
   }
 }
 
@@ -315,10 +336,10 @@ Client.prototype._write = function (obj, enc, cb) {
 
 Client.prototype._writev = function (objs, cb) {
   // Limit the size of individual writes to manageable batches, primarily to
-  // limit large sync pauses due to `_encode`ing in `_writevCleaned`. This value
-  // is not particularly well tuned. It was selected to get syncs pauses under
+  // limit large sync pauses due to `_encode`ing in `_writeBatch`. This value
+  // is not particularly well tuned. It was selected to get sync pauses under
   // 10ms on a developer machine.
-  const MAX_WRITE_BATCH_SIZE = 100
+  const MAX_WRITE_BATCH_SIZE = 32
 
   this._log.trace({writableState: this._writableState}, '_writev %d objs', objs.length)
   let offset = 0
@@ -335,15 +356,15 @@ Client.prototype._writev = function (objs, cb) {
 
     if (offset === 0 && flushIdx === -1 && objs.length <= MAX_WRITE_BATCH_SIZE) {
       // A shortcut if there is no `flush` and the whole `objs` fits in a batch.
-      this._writevCleaned(objs, cb)
+      this._writeBatch(objs, cb)
     } else if (flushIdx === -1) {
       // No `flush` in this batch.
-      this._writevCleaned(objs.slice(offset, limit),
+      this._writeBatch(objs.slice(offset, limit),
         limit === objs.length ? cb : processBatch)
       offset = limit
     } else if (flushIdx > offset) {
       // There are some events in the queue before a `flush`.
-      this._writevCleaned(objs.slice(offset, flushIdx), processBatch)
+      this._writeBatch(objs.slice(offset, flushIdx), processBatch)
       offset = flushIdx
     } else if (flushIdx === objs.length - 1) {
       // The next item is a flush, and it is the *last* item in the queue.
@@ -362,18 +383,30 @@ function encodeObject (obj) {
   return this._encode(obj.chunk, obj.encoding)
 }
 
-Client.prototype._writevCleaned = function (objs, cb) {
-  const t = process.hrtime()
+Client.prototype._writeBatch = function (objs, cb) {
+  const t1 = process.hrtime()
   const chunk = objs.map(encodeObject.bind(this)).join('')
-  const d = process.hrtime(t)
-  this._log.warn({
-    elapsedMs: d[0] * 1e3 + d[1] / 1e6,
-    numObjs: objs.length,
-    chunkLen: chunk.length
-  }, '_writevCleaned: encoded objects')
+  const encodeTimeMs = deltaMs(t1)
 
   this._numEventsEnqueued += objs.length
   this._chopper.write(chunk, cb)
+  const fullTimeMs = deltaMs(t1)
+
+  if (fullTimeMs > this._slowWriteBatch.fullTimeMs) {
+    this._slowWriteBatch.encodeTimeMs = encodeTimeMs
+    this._slowWriteBatch.fullTimeMs = fullTimeMs
+    this._slowWriteBatch.numEvents = objs.length
+    this._slowWriteBatch.numBytes = chunk.length
+  }
+  if (fullTimeMs > 10) {
+    this._slowWriteBatch.numOver10Ms++
+  }
+  this._log.warn({
+    encodeTimeMs: encodeTimeMs,
+    fullTimeMs: fullTimeMs,
+    numEvents: objs.length,
+    numBytes: chunk.length
+  }, '_writeBatch')
 }
 
 Client.prototype._writeFlush = function (cb) {
