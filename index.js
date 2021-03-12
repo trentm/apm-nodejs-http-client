@@ -72,6 +72,7 @@ function Client (opts) {
   this._transport = null
   this._configTimer = null
   this._encodedMetadata = null
+  this._backoffReconnectCount = 0
 
   // Internal runtime stats. Possibly useful for developer debugging/tuning.
   this._numEvents = 0 // number of events given to the client for reporting
@@ -144,7 +145,8 @@ Client.prototype._getStats = function () {
     numEventsDropped: this._numEventsDropped,
     numEventsEnqueued: this._numEventsEnqueued,
     numEventsSent: this.sent,
-    slowWriteBatch: this._slowWriteBatch
+    slowWriteBatch: this._slowWriteBatch,
+    backoffReconnectCount: this._backoffReconnectCount
   }
 }
 
@@ -591,9 +593,23 @@ Client.prototype._destroy = function (err, cb) {
   cb(err)
 }
 
-function deltaMs (t) {
-  const d = process.hrtime(t)
-  return d[0] * 1e3 + d[1] / 1e6
+// Return the appropriate backoff delay (in milliseconds) before a next possible
+// request to APM server.
+// Spec: https://github.com/elastic/apm/blob/master/specs/agents/transport.md#transport-errors
+Client.prototype._getBackoffDelay = function (isErr) {
+  let reconnectCount = this._backoffReconnectCount
+  if (isErr) {
+    this._backoffReconnectCount++
+  } else {
+    this._backoffReconnectCount = 0
+    reconnectCount = 0
+  }
+
+  // min(reconnectCount++, 6) ** 2 ± 10%
+  const delayS = Math.pow(Math.min(reconnectCount, 6), 2)
+  const jitterS = delayS * (0.2 * Math.random() - 0.1)
+  const delayMs = (delayS + jitterS) * 1000
+  return delayMs
 }
 
 function getChoppedStreamHandler (client, onerror) {
@@ -705,13 +721,20 @@ function getChoppedStreamHandler (client, onerror) {
         client._onflushed = null
       }
 
+      const backoffDelayMs = client._getBackoffDelay(!!err)
       if (err) {
-        log.error({ timeline, bytesWritten, err }, 'conclude intake request: error')
+        log.error({ timeline, bytesWritten, backoffDelayMs, err },
+          'conclude intake request: error')
         onerror(err)
       } else {
-        log.error({ timeline, bytesWritten }, 'conclude intake request: success')
+        log.error({ timeline, bytesWritten, backoffDelayMs },
+          'conclude intake request: success')
       }
-      next()
+      if (backoffDelayMs > 0) {
+        setTimeout(next, backoffDelayMs).unref()
+      } else {
+        next()
+      }
     }
 
     // Start the request and set its timeout.
@@ -830,9 +853,10 @@ function getChoppedStreamHandler (client, onerror) {
     })
 
     // intakeReq.on('abort', () => { log.trace('intakeReq "abort"') })
-    // intakeReq.on('finish', () => { log.trace('intakeReq "finish"') })
-    intakeReq.on('close', () => {
-      log.trace('intakeReq "close"')
+    // intakeReq.on('close', () => { log.trace('intakeReq "close"') })
+    // XXX What was the error scenario that led me to use 'close' instead of 'finish' here?
+    intakeReq.on('finish', () => {
+      log.trace('intakeReq "finish"')
       completePart('intakeReq')
     })
     intakeReq.on('error', (err) => {
@@ -1320,4 +1344,9 @@ function processConfigErrorResponse (res, buf, err) {
   }
 
   return err
+}
+
+function deltaMs (t) {
+  const d = process.hrtime(t)
+  return d[0] * 1e3 + d[1] / 1e6
 }
