@@ -344,7 +344,7 @@ Client.prototype._writev = function (objs, cb) {
   // 10ms on a developer machine.
   const MAX_WRITE_BATCH_SIZE = 32
 
-  this._log.trace({writableState: this._writableState}, '_writev %d objs', objs.length)
+  this._log.trace({ writableState: this._writableState }, '_writev %d objs', objs.length)
   let offset = 0
 
   const processBatch = () => {
@@ -438,7 +438,7 @@ Client.prototype._maybeCork = function () {
           !this._writableState.bufferProcessing &&
           !!this._writableState.bufferedRequest
         if (expectToClearBuffer) {
-          this._log.trace({writableState: this._writableState, expectToClearBuffer},
+          this._log.trace({ writableState: this._writableState, expectToClearBuffer },
             'uncork (from _corkTimer)')
         }
         this.uncork()
@@ -469,7 +469,7 @@ Client.prototype._maybeUncork = function () {
           !this._writableState.bufferProcessing &&
           !!this._writableState.bufferedRequest
         if (expectToClearBuffer) {
-          this._log.trace({writableState: this._writableState, expectToClearBuffer},
+          this._log.trace({ writableState: this._writableState, expectToClearBuffer },
             'uncork (from _maybeUncork + nextTick)')
         }
         this.uncork()
@@ -906,6 +906,7 @@ function getChoppedStreamHandler (client, onerror) {
     // XXX payloadLogFile
   }
 
+  /* eslint-disable-next-line no-unused-vars */
   function onStream (stream, next) {
     const startT = process.hrtime()
     const startL = client._writableState.length
@@ -941,7 +942,7 @@ function getChoppedStreamHandler (client, onerror) {
         if (node8) {
           stream.end()
         } else {
-          console.warn('XXX call destroyStream from "response" extra event handler', )
+          console.warn('XXX call destroyStream from "response" extra event handler')
           destroyStream(stream)
         }
       }
@@ -1000,7 +1001,7 @@ function getChoppedStreamHandler (client, onerror) {
       client._log.trace({
         timeline,
         elapsedMs: diffT[0] * 1e3 + diffT[1] / 1e6,
-        queueLenDelta: startL + ' -> ' + client._writableState.length + ' = ' + diffL,
+        queueLenDelta: startL + ' -> ' + client._writableState.length + ' = ' + diffL
       }, 'onStream: finished')
       next()
     })
