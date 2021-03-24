@@ -17,6 +17,7 @@ const streamToBuffer = require('fast-stream-to-buffer')
 const StreamChopper = require('stream-chopper')
 
 const ndjson = require('./lib/ndjson')
+const { NoopLogger } = require('./lib/logging')
 const truncate = require('./lib/truncate')
 const pkg = require('./package')
 
@@ -89,7 +90,7 @@ function Client (opts) {
   }
 
   this.config(opts)
-  this._log = this._conf.logger
+  this._log = this._conf.logger || new NoopLogger()
 
   // start stream in corked mode, uncork when cloud
   // metadata is fetched and assigned.  Also, the
@@ -1268,10 +1269,10 @@ function bufFromChunks (chunks) {
 // Dev Note: Various techniques exist to wrap `Error`s in node.js and JavaScript
 // to provide a cause chain, e.g. see
 // https://www.joyent.com/node-js/production/design/errors
-// However, I'm not aware of a de facto "winner". For now we will simply
-// prefix the existing error object's `message` property. This is simple and
-// preserves the root error `stack`.
-// See https://www.joyent.com/node-js/production/design/errors
+// However, I'm not aware of a de facto "winner". Eventually there may be
+// https://github.com/tc39/proposal-error-cause
+// For now we will simply prefix the existing error object's `message` property.
+// This is simple and preserves the root error `stack`.
 function wrapError (err, msg) {
   err.message = msg + ': ' + err.message
   return err
@@ -1346,6 +1347,8 @@ function processConfigErrorResponse (res, buf, err) {
   return err
 }
 
+// Return the time difference (in milliseconds) between the given time `t`
+// (a 2-tuple as returned by `process.hrtime()`) and now.
 function deltaMs (t) {
   const d = process.hrtime(t)
   return d[0] * 1e3 + d[1] / 1e6
