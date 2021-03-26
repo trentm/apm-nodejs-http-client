@@ -75,10 +75,10 @@ function Client (opts) {
   this._encodedMetadata = null
   this._backoffReconnectCount = 0
 
-  // Internal runtime stats. Possibly useful for developer debugging/tuning.
-  this._numEvents = 0 // number of events given to the client for reporting
+  // Internal runtime stats for developer debugging/tuning.
+  this._numEvents = 0 // number of events given to the client
   this._numEventsDropped = 0 // number of events dropped because overloaded
-  this._numEventsEnqueued = 0 // number of events written through to be sent
+  this._numEventsEnqueued = 0 // number of events written through to chopper
   this.sent = 0 // number of events sent to APM server (not necessarily accepted)
   this._slowWriteBatch = { // data on slow or the slowest _writeBatch
     numOver10Ms: 0,
@@ -324,16 +324,13 @@ Client.prototype._write = function (obj, enc, cb) {
   } else {
     const t = process.hrtime()
     const chunk = this._encode(obj, enc)
-    const d = process.hrtime(t)
-    this._log.trace({
-      elapsedMs: d[0] * 1e3 + d[1] / 1e6,
-      numObjs: 1,
-      chunkLen: chunk.length
-    }, '_write: encode object')
-
     this._numEventsEnqueued++
     this._chopper.write(chunk, cb)
-    // this._chopper.write(this._encode(obj, enc), cb)
+    this._log.trace({
+      fullTimeMs: deltaMs(t),
+      numEvents: 1,
+      numBytes: chunk.length
+    }, '_write: encode object')
   }
 }
 
@@ -386,14 +383,16 @@ function encodeObject (obj) {
   return this._encode(obj.chunk, obj.encoding)
 }
 
+// Write a batch of events (excluding specially handled "flush" events) to
+// the stream chopper.
 Client.prototype._writeBatch = function (objs, cb) {
-  const t1 = process.hrtime()
+  const t = process.hrtime()
   const chunk = objs.map(encodeObject.bind(this)).join('')
-  const encodeTimeMs = deltaMs(t1)
+  const encodeTimeMs = deltaMs(t)
 
   this._numEventsEnqueued += objs.length
   this._chopper.write(chunk, cb)
-  const fullTimeMs = deltaMs(t1)
+  const fullTimeMs = deltaMs(t)
 
   if (fullTimeMs > this._slowWriteBatch.fullTimeMs) {
     this._slowWriteBatch.encodeTimeMs = encodeTimeMs
