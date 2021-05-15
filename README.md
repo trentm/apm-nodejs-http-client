@@ -319,7 +319,7 @@ Send a error to the APM Server.
 
 Arguments:
 
-- `error` - A error object that can be serialized to JSON
+- `error` - An error object that can be serialized to JSON
 - `callback` - Callback is called when the `error` have been flushed to
   the underlying system
 
@@ -329,9 +329,19 @@ Send a metricset to the APM Server.
 
 Arguments:
 
-- `error` - A error object that can be serialized to JSON
-- `callback` - Callback is called when the `metricset` have been flushed to
+- `metricset` - A metricset object that can be serialized to JSON
+- `callback` - Callback is called when the `metricset` has been flushed to
   the underlying system
+
+### `client.sendProfile(profile[, callback])`
+
+**Experimental.** Send a pprof profile to the APM Server.
+
+Arguments:
+
+- `profile` - A pprof profile buffer.
+- `callback(err)` - Callback is called when the `profile` has been sent or
+  queued.
 
 ### `client.flush([callback])`
 

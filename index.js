@@ -11,6 +11,7 @@ const { URL } = require('url')
 const zlib = require('zlib')
 
 const Filters = require('object-filter-sequence')
+const FormData = require('form-data')
 const querystring = require('querystring')
 const Writable = require('readable-stream').Writable
 const getContainerInfo = require('./lib/container-info')
@@ -231,6 +232,7 @@ Client.prototype.config = function (opts) {
   // http request options
   this._conf.requestIntake = getIntakeRequestOptions(this._conf, this._agent)
   this._conf.requestConfig = getConfigRequestOptions(this._conf, this._agent)
+  this._conf.requestIntakeProfile = getIntakeProfileRequestOptions(this._conf, this._agent)
 
   this._conf.metadata = getMetadata(this._conf)
 
@@ -568,6 +570,55 @@ Client.prototype.sendMetricSet = function (metricset, cb) {
   }
   this._maybeCork()
   return this.write({ metricset }, Client.encoding.METRICSET, cb)
+}
+
+Client.prototype.sendProfile = function (profile, cb) {
+  // TODO: eventually this needs to buffer & retry
+  // TODO: Consider *not* using form-data to handle the submission. I'd just
+  //       want a multipart lib that takes the parts (and params) and returns
+  //       a 'content-type' header (with generated boundary) and a Buffer
+  //       with the body bytes to send.
+  // TODO: error quickly if profile is >10MiB (the current apm-server max)
+  //       Note that FormData's `maxDataSize` does nothing in my experience.
+
+  if (!this._encodedMetadata) {
+    // TODO: put on buffer and try later
+    this._log.error('not sending profile before _encodedMetadata is ready')
+    return
+  }
+  // XXX hack because profile intake wants metadata *without* the `{"metadata":{...}}` wrapping
+  // XXX buffer this (could be done in _resetEncodedMetadata())
+  const metadata = this._encodedMetadata.slice('{"metadata":'.length, this._encodedMetadata.length - 1)
+
+  // Object.assign to workaround https://github.com/form-data/form-data/issues/507
+  const submitOpts = Object.assign({}, this._conf.requestIntakeProfile)
+  const formData = new FormData({})
+  formData.append('metadata', metadata, { contentType: 'application/json' })
+  formData.append('profile', profile, { contentType: 'application/x-protobuf; messageType="perftools.profiles.Profile"' })
+  const req = formData.submit(submitOpts, (err, res) => {
+    if (err) {
+      // XXX might want just debug/trace log here
+      this._log.error({ err, res, req }, 'could not submit profile to APM server')
+      if (cb) {
+        cb(err)
+      }
+      return
+    }
+
+    const chunks = []
+    res.on('data', (chunk) => {
+      chunks.push(chunk)
+    })
+    res.on('end', () => {
+      if (res.statusCode !== 202) {
+        cb(new Error(`unexpected response status sending profile: statusCode=${res.statusCode} resBody=${chunks.join('')}`))
+        return
+      }
+      // XXX could also expect the body to be `{ accepted: 1 }`
+      cb(null)
+    })
+  })
+
 }
 
 Client.prototype.flush = function (cb) {
@@ -982,12 +1033,18 @@ function getConfigRequestOptions (opts, agent) {
   return getBasicRequestOptions('GET', path, headers, opts, agent)
 }
 
+function getIntakeProfileRequestOptions (opts, agent) {
+  const headers = getHeaders(opts)
+  return getBasicRequestOptions('POST', '/intake/v2/profile', headers, opts, agent)
+}
+
 function getBasicRequestOptions (method, defaultPath, headers, opts, agent) {
   return {
     agent: agent,
     rejectUnauthorized: opts.rejectUnauthorized !== false,
     ca: opts.serverCaCert,
     hostname: opts.serverUrl.hostname,
+    protocol: opts.serverUrl.protocol,
     port: opts.serverUrl.port,
     method,
     path: opts.serverUrl.pathname === '/' ? defaultPath : opts.serverUrl.pathname + defaultPath,
